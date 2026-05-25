@@ -1,15 +1,17 @@
+import json
 import pickle
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from urllib import request as urlrequest
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanovllm.utils.loader import broadcast_loaded_model, load_model, load_model_from_peer
 
 
 class ModelRunner:
@@ -23,13 +25,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", config.distributed_init_method, world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.load_model()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -46,6 +48,63 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    def load_model(self):
+        if self.config.peer_load_world_size == 1:
+            load_model(self.model, self.config.model)
+            return
+        assert self.world_size == 1, "peer loading full replicas is only supported with tensor_parallel_size=1"
+        assert self.config.peer_load_rank >= 0
+        if self.config.peer_load_rank == self.config.peer_load_src:
+            load_model(self.model, self.config.model)
+            return
+        self.request_peer_broadcast()
+        dist.destroy_process_group()
+        dist.init_process_group(
+            "nccl",
+            self.config.peer_load_init_method,
+            world_size=self.config.peer_load_world_size,
+            rank=self.config.peer_load_rank,
+        )
+        load_model_from_peer(self.model, self.config.model, src=self.config.peer_load_src)
+        dist.destroy_process_group()
+        dist.init_process_group(
+            "nccl",
+            self.config.distributed_init_method,
+            world_size=self.world_size,
+            rank=self.rank,
+        )
+
+    def request_peer_broadcast(self):
+        if not self.config.peer_load_src_url:
+            return
+        payload = json.dumps({
+            "init_method": self.config.peer_load_init_method,
+            "world_size": self.config.peer_load_world_size,
+            "src": self.config.peer_load_src,
+        }).encode("utf-8")
+        req = urlrequest.Request(
+            self.config.peer_load_src_url.rstrip("/") + "/admin/peer_broadcast",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"failed to trigger peer broadcast: HTTP {resp.status}")
+
+    def broadcast_model_to_peer(self, init_method: str, world_size: int, src: int):
+        assert self.world_size == 1, "peer loading full replicas is only supported with tensor_parallel_size=1"
+        dist.destroy_process_group()
+        dist.init_process_group("nccl", init_method, world_size=world_size, rank=src)
+        broadcast_loaded_model(self.model, src=src)
+        dist.destroy_process_group()
+        dist.init_process_group(
+            "nccl",
+            self.config.distributed_init_method,
+            world_size=self.world_size,
+            rank=self.rank,
+        )
 
     def exit(self):
         if self.world_size > 1:
@@ -91,7 +150,8 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        max_num_batched_tokens = min(self.config.max_num_batched_tokens, self.config.warmup_max_tokens)
+        max_model_len = self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
